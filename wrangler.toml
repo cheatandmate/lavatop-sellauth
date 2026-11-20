@@ -1,0 +1,20 @@
+name = "lava-sellauth"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# Created automatically by the Deploy to Cloudflare button.
+[[kv_namespaces]]
+binding = "STATE"
+
+# Safety net: re-checks payments whose webhook never arrived.
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+LAVA_BASE_URL = "https://gate.lava.top"
+SELLAUTH_BASE_URL = "https://api.sellauth.com/v1"
+SELLAUTH_SHOP_URL = "https://YOURSHOP.mysellauth.com"   # buyers are sent back to <this>/checkout/<ref>
+LAVA_CURRENCY = "RUB"          # buyers are charged in this currency (Lava: RUB, USD, EUR); others are converted
+LAVA_MARKUP_PCT = "0"          # optional safety margin on converted amounts, e.g. "2" adds 2%
+# LAVA_PAYMENT_PROVIDER = "PAY2ME"  # optional: SMART_GLOCAL (RUB default), PAY2ME (RUB), UNLIMINT (EUR/USD), PAYPAL
+# LAVA_PAYMENT_METHOD = "SBP"       # optional for PAY2ME: CARD (default), SBP; UNLIMINT: CARD, PIX, IDEAL, ...

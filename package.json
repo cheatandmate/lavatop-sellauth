@@ -1,0 +1,42 @@
+{
+  "name": "lava-sellauth-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node test/lava.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "LAVA_API_KEY": {
+        "description": "Lava API key (lava.top > Settings > API > API keys). Used for POST /api/v3/invoice and GET /api/v1/invoices/{id}."
+      },
+      "LAVA_WEBHOOK_KEY": {
+        "description": "Webhook API key YOU generate (any random string, max 80 chars) and paste into the Lava product's webhook settings. Lava sends it as the X-Api-Key header on every webhook."
+      },
+      "LAVA_OFFER_ID": {
+        "description": "UUID of the Lava offer with dynamic pricing ('Price on request via API'). The Worker charges the converted SellAuth invoice amount on this offer."
+      },
+      "SELLAUTH_API_KEY": {
+        "description": "SellAuth API key from [Account > Developers](https://dash.sellauth.com/api). Scope it to your shop."
+      },
+      "SELLAUTH_SHOP_ID": {
+        "description": "Your numeric SellAuth shop ID (the number in API URLs like `/shops/1/`)."
+      },
+      "SELLAUTH_SHOP_URL": {
+        "description": "Your storefront URL, e.g. `https://yourshop.mysellauth.com`. Buyers are returned to `<url>/checkout/<ref>`."
+      },
+      "LAVA_BASE_URL": {
+        "description": "Lava API base. Leave the default `https://gate.lava.top`."
+      },
+      "SELLAUTH_BASE_URL": {
+        "description": "SellAuth API base. Leave the default `https://api.sellauth.com/v1`."
+      }
+    }
+  }
+}
