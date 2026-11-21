@@ -4,9 +4,9 @@ Uses SellAuth's **Custom Payment Method > Redirect to URL** and `invoices/{id}/p
 and Lava's `POST /api/v3/invoice`, `GET /api/v1/invoices/{id}` and the webhook (`payment.success`).
 
 ## 0. One-click deploy
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YOUR_USER/YOUR_REPO)
-Replace `YOUR_USER/YOUR_REPO` with this repo's path (repo must be **public**). Cloudflare shows a form for every
-key below and creates the KV namespace for you. Then skip to step 3.
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cheatandmate/lavatop-sellauth)
+The button creates a copy of the repo in your Cloudflare account, shows a form for every key below and
+creates the KV namespace for you. Then skip to step 3.
 
 **If the form does not ask for the keys:** Cloudflare builds the form from `.dev.vars.example` in the repo root.
 That file starts with a dot, so it is hidden in Explorer/Finder and is easy to miss when uploading to GitHub.
@@ -36,15 +36,43 @@ npm test && npx wrangler deploy
    and the **webhook API key**: paste the same value you stored as the `LAVA_WEBHOOK_KEY` secret. Lava signs
    every webhook with this key in the `X-Api-Key` header; the Worker compares it (401 otherwise).
 
-## 3. Add the payment method in SellAuth
-Dashboard > Payment Methods > add **Redirect to URL** (needs a plan with custom payment methods), Redirect URL:
-```
-https://<your-worker>.workers.dev/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}
-```
+## 3. Add the payment methods in SellAuth
+Dashboard > Payment Methods > add **Redirect to URL** (needs a plan with custom payment methods). Create **separate
+methods for SBP and card** — the `pay=` parameter in the URL picks the Lava method:
 
-## 4. Currency: invoices are charged in `LAVA_CURRENCY` (default RUB)
-Lava supports RUB, USD and EUR. The Worker charges the SellAuth invoice in `LAVA_CURRENCY`:
-- RUB target: rate source is `cbr-xml-daily.ru` (Central Bank of Russia); EUR/USD target: `open.er-api.com`;
+| Method name | Redirect URL |
+|---|---|
+| Оплата картой (RUB) | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=card` |
+| Оплата СБП | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=sbp` |
+| PayPal | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=paypal` |
+| PIX | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=pix` |
+| Apple Pay | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=applepay` |
+| iDEAL | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=ideal` |
+| SEPA transfer | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=sepa` |
+| Bancontact | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=bancontact` |
+| Карта (USD) | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=cardusd` |
+| Карта (EUR) | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=cardeur` |
+
+The methods are fixed in code — no currency settings needed:
+- **`pay=card`** — invoice converted to RUB, Lava's default RUB checkout (card);
+- **`pay=sbp`** — invoice converted to RUB, PAY2ME + SBP;
+- **`pay=paypal`** — invoice converted to USD, PayPal;
+- **`pay=pix`** — invoice converted to USD, UNLIMINT + PIX;
+- **`pay=applepay`** — invoice converted to USD, UNLIMINT + APPLE_PAY;
+- **`pay=ideal`** — invoice converted to EUR, UNLIMINT + IDEAL;
+- **`pay=sepa`** — invoice converted to EUR, UNLIMINT + SEPATRANSFER;
+- **`pay=bancontact`** — invoice converted to EUR, UNLIMINT + BANCONTACT;
+- **`pay=cardusd`** — invoice converted to USD, Lava's default USD checkout (UNLIMINT + card);
+- **`pay=cardeur`** — invoice converted to EUR, Lava's default EUR checkout (UNLIMINT + card);
+- no `pay` parameter — USD invoice goes to PayPal, everything else to the default RUB checkout;
+- an unknown `pay` value falls back to the default RUB checkout;
+- BIZUM/MBWAY are not offered: Lava requires the buyer's full name and phone number, which the
+  SellAuth redirect URL does not carry.
+
+## 4. Currency and conversion
+The charge currency is chosen by the payment method (RUB for card/SBP, USD for PayPal), and the
+SellAuth invoice is converted when needed:
+- RUB target: rate source is `cbr-xml-daily.ru` (Central Bank of Russia); USD target: `open.er-api.com`;
 - rates are cached 1 h in KV; if the source is down, a cached rate up to 24 h old is used, otherwise the payment
   is **refused** (never charged at face value);
 - converted amounts are rounded **up** to the next cent/kopeck; `LAVA_MARKUP_PCT` (wrangler.toml) adds an

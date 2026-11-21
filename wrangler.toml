@@ -14,7 +14,19 @@ crons = ["*/5 * * * *"]
 LAVA_BASE_URL = "https://gate.lava.top"
 SELLAUTH_BASE_URL = "https://api.sellauth.com/v1"
 SELLAUTH_SHOP_URL = "https://YOURSHOP.mysellauth.com"   # buyers are sent back to <this>/checkout/<ref>
-LAVA_CURRENCY = "RUB"          # buyers are charged in this currency (Lava: RUB, USD, EUR); others are converted
-LAVA_MARKUP_PCT = "0"          # optional safety margin on converted amounts, e.g. "2" adds 2%
-# LAVA_PAYMENT_PROVIDER = "PAY2ME"  # optional: SMART_GLOCAL (RUB default), PAY2ME (RUB), UNLIMINT (EUR/USD), PAYPAL
-# LAVA_PAYMENT_METHOD = "SBP"       # optional for PAY2ME: CARD (default), SBP; UNLIMINT: CARD, PIX, IDEAL, ...
+
+# Payment methods are fixed in code, selected by the `pay` parameter
+# of the SellAuth redirect URL (no currency settings needed):
+#   &pay=sbp        -> invoice converted to RUB, PAY2ME + SBP
+#   &pay=card       -> invoice converted to RUB, Lava's default RUB checkout (card)
+#   &pay=paypal     -> invoice converted to USD, PayPal
+#   &pay=pix        -> invoice converted to USD, UNLIMINT + PIX
+#   &pay=applepay   -> invoice converted to USD, UNLIMINT + APPLE_PAY
+#   &pay=ideal      -> invoice converted to EUR, UNLIMINT + IDEAL
+#   &pay=sepa       -> invoice converted to EUR, UNLIMINT + SEPATRANSFER
+#   &pay=bancontact -> invoice converted to EUR, UNLIMINT + BANCONTACT
+#   &pay=cardusd    -> invoice converted to USD, Lava's default USD checkout (card)
+#   &pay=cardeur    -> invoice converted to EUR, Lava's default EUR checkout (card)
+#   (no pay)        -> USD invoice: PayPal; everything else: default RUB checkout
+# BIZUM/MBWAY are not offered (Lava requires the buyer's phone, which the
+# SellAuth redirect URL does not carry). Lava amount limits apply per currency.

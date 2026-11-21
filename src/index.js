@@ -38,7 +38,7 @@ const DONE_STATUSES = ["COMPLETED"];
 const DEAD_STATUSES = ["FAILED", "CANCELLED", "CANCELLED_SUBSCRIPTION", "EXPIRED"];
 
 // Shown on GET / so you can confirm which code is actually deployed.
-const BUILD = "2026-11-20.1";
+const BUILD = "2026-11-21.2";
 
 const DEFAULT_LAVA_BASE = "https://gate.lava.top";
 const DEFAULT_SELLAUTH_BASE = "https://api.sellauth.com/v1";
@@ -114,6 +114,7 @@ async function lava(env, method, path, body) {
     console.log("lava error", method, path, res.status, raw.slice(0, 500));
     const err = new Error(`Lava ${method} ${path} failed (${res.status})`);
     err.status = res.status;
+    err.detail = (json && json.error) || raw.slice(0, 200); // e.g. "Amount=3.99 not in allowed limits=(5, 10000) for USD"
     throw err;
   }
   return json;
@@ -204,8 +205,48 @@ async function handleStart(env, request) {
     console.log("invoice not payable, status:", st, invoiceId);
     return Response.redirect(fallback, 302); // SellAuth's checkout page shows the real state
   }
-  // Charge in LAVA_CURRENCY (default RUB, Lava supports RUB/USD/EUR).
-  const target = String(env.LAVA_CURRENCY || "RUB").toUpperCase();
+  // Method selection via the `pay` parameter of the SellAuth redirect URL
+  // (all routes Lava's public API offers; European methods charge in EUR):
+  //   pay=card       -> RUB, Lava's default RUB checkout (card)
+  //   pay=sbp        -> RUB, PAY2ME + SBP
+  //   pay=paypal     -> USD, PayPal
+  //   pay=pix        -> USD, UNLIMINT + PIX
+  //   pay=applepay   -> USD, UNLIMINT + APPLE_PAY
+  //   pay=ideal      -> EUR, UNLIMINT + IDEAL
+  //   pay=sepa       -> EUR, UNLIMINT + SEPATRANSFER
+  //   pay=bancontact -> EUR, UNLIMINT + BANCONTACT
+  //   pay=cardusd    -> USD, Lava's default USD checkout (UNLIMINT + card)
+  //   pay=cardeur    -> EUR, Lava's default EUR checkout (UNLIMINT + card)
+  // BIZUM/MBWAY are not offered: Lava requires the buyer's full name and
+  // phone (walletId), which the SellAuth redirect URL does not carry.
+  // Without `pay`: USD invoices go to PayPal, everything else to the default
+  // RUB checkout. Amounts always come from SellAuth, never the URL.
+  const METHODS = Object.assign(Object.create(null), {
+    card:       { target: "RUB" },
+    sbp:        { target: "RUB", provider: "PAY2ME", method: "SBP" },
+    paypal:     { target: "USD", provider: "PAYPAL" },
+    pix:        { target: "USD", provider: "UNLIMINT", method: "PIX" },
+    applepay:   { target: "USD", provider: "UNLIMINT", method: "APPLE_PAY" },
+    ideal:      { target: "EUR", provider: "UNLIMINT", method: "IDEAL" },
+    sepa:       { target: "EUR", provider: "UNLIMINT", method: "SEPATRANSFER" },
+    bancontact: { target: "EUR", provider: "UNLIMINT", method: "BANCONTACT" },
+    cardusd:    { target: "USD" }, // provider/method unset: Lava's default USD checkout
+    cardeur:    { target: "EUR" }, // provider/method unset: Lava's default EUR checkout
+  });
+  const pay = (q.get("pay") || "").trim().toLowerCase();
+  let target;
+  let provider;
+  let method;
+  if (Object.hasOwn(METHODS, pay)) {
+    ({ target, provider, method } = METHODS[pay]);
+  } else if (pay === "") {
+    if (currency === "USD") { target = "USD"; provider = "PAYPAL"; } // Lava's USD providers: UNLIMINT/PAYPAL
+    else target = "RUB"; // Lava's default RUB checkout (card)
+  } else {
+    console.log("unknown pay param, falling back to the default RUB checkout:", pay, invoiceId);
+    target = "RUB"; // Lava's default RUB checkout (card)
+  }
+
   let amount = money(amountRaw);
   let rate = 1;
   if (currency !== target) {
@@ -227,8 +268,8 @@ async function handleStart(env, request) {
     failure_return_url: back,
     cancel_return_url: back,
   };
-  if (env.LAVA_PAYMENT_PROVIDER) body.paymentProvider = env.LAVA_PAYMENT_PROVIDER;
-  if (env.LAVA_PAYMENT_METHOD) body.paymentMethod = env.LAVA_PAYMENT_METHOD;
+  if (provider) body.paymentProvider = provider;
+  if (method) body.paymentMethod = method;
   const tx = await lava(env, "POST", "/api/v3/invoice", body);
   if (!tx.id || !tx.paymentUrl) {
     console.log("Unexpected Lava response", JSON.stringify(tx).slice(0, 500));
@@ -336,7 +377,14 @@ export default {
       const missing = missingConfig(env);
       if (missing.length) { console.log("Not configured. Missing:", missing.join(", ")); return text("Service is not configured yet.", 503); }
       try { return await handleStart(env, request); }
-      catch (e) { console.log("start failed", String(e)); return text("Could not start payment.", 502); }
+      catch (e) {
+        console.log("start failed", String(e));
+        // Surface Lava's amount limits to the buyer ("Amount=3.99 not in
+        // allowed limits=(5, 10000) for USD") instead of a blank error page.
+        const m = typeof e?.detail === "string" && e.detail.match(/limits=\(([^,)]+),\s*([^)]+)\)\s*for\s*([A-Z]{3})/);
+        if (m) return text(`This payment method supports amounts from ${m[1]} to ${m[2]} ${m[3]}. Please choose a different amount or payment method.`, 502);
+        return text("Could not start payment.", 502);
+      }
     }
     if (request.method === "POST" && pathname === "/lava/callback") return handleCallback(env, request);
     return text("Not found", 404);
