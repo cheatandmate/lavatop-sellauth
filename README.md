@@ -1,115 +1,220 @@
-# Lava.top x SellAuth on Cloudflare Workers
+# Lava.top x SellAuth на Cloudflare Workers
 
-Uses SellAuth's **Custom Payment Method > Redirect to URL** and `invoices/{id}/process?mark_as_paid=true`,
-and Lava's `POST /api/v3/invoice`, `GET /api/v1/invoices/{id}` and the webhook (`payment.success`).
+Воркер связывает магазин на SellAuth с приёмом платежей через Lava.top.
+Покупатель выбирает способ оплаты в чекауте SellAuth, воркер создаёт инвойс в Lava
+на нужную сумму в нужной валюте, а после оплаты автоматически выдаёт товар.
 
-## 0. One-click deploy
+## Как это работает
+
+```
+1. Покупатель в чекауте SellAuth нажимает кнопку способа оплаты
+      → редирект на GET https://<worker>/start?invoice={id}&ref={unique_id}&...&pay=<метод>
+2. Воркер читает инвойс из SellAuth API (сумма и валюта берутся оттуда, а НЕ из URL —
+   покупатель мог подменить параметры), конвертирует в валюту выбранного метода
+      → POST https://gate.lava.top/api/v3/invoice
+      → редирект покупателя на платёжную страницу Lava
+3. После оплаты Lava шлёт вебхук: POST https://<worker>/lava/callback (подпись X-Api-Key)
+      → воркер перепроверяет контракт через GET /api/v1/invoices/{id}
+      → если статус COMPLETED и сумма не меньше ожидаемой:
+        GET SellAuth /invoices/{id}/process?mark_as_paid=true — товар выдан
+4. Крон воркера (каждые 5 минут) доставляет заказы, чей вебхук потерялся
+   (в течение 6 часов после создания платежа)
+```
+
+Способы оплаты фиксированы в коде и выбираются параметром `pay` в ссылке
+(настройки валюты в wrangler.toml не нужны):
+
+| `pay=` | Валюта заряда | Провайдер / метод |
+|---|---|---|
+| `card` | RUB | дефолтный чекаут Lava (карта) |
+| `sbp` | RUB | PAY2ME + SBP |
+| `paypal` | USD | PayPal |
+| `pix` | USD | UNLIMINT + PIX |
+| `applepay` | USD | UNLIMINT + APPLE_PAY |
+| `ideal` | EUR | UNLIMINT + IDEAL |
+| `sepa` | EUR | UNLIMINT + SEPATRANSFER |
+| `bancontact` | EUR | UNLIMINT + BANCONTACT |
+| `cardusd` | USD | дефолтный чекаут Lava в USD (UNLIMINT + карта) |
+| `cardeur` | EUR | дефолтный чекаут Lava в EUR (UNLIMINT + карта) |
+| *(без `pay`)* | — | USD-инвойс → PayPal; остальные → дефолтный RUB-чекаут |
+
+BIZUM и MB WAY не поддерживаются: Lava требует имя и телефон покупателя
+(`walletId`) при создании инвойса, а SellAuth в redirect-ссылке их не передаёт.
+
+---
+
+## Шаг 1. Деплой воркера
+
+### Вариант А — кнопкой (рекомендую)
+
+1. Нажми кнопку — Cloudflare скопирует репозиторий и предложит форму:
+
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cheatandmate/lavatop-sellauth)
-The button creates a copy of the repo in your Cloudflare account, shows a form for every key below and
-creates the KV namespace for you. Then skip to step 3.
 
-**If the form does not ask for the keys:** Cloudflare builds the form from `.dev.vars.example` in the repo root.
-That file starts with a dot, so it is hidden in Explorer/Finder and is easy to miss when uploading to GitHub.
-Check that it is in the repo (and not empty). Either way you can always add the keys afterwards:
-Worker > Settings > Variables and Secrets > Add > type **Secret** (`LAVA_API_KEY`, `LAVA_WEBHOOK_KEY`,
-`LAVA_OFFER_ID`, `SELLAUTH_API_KEY`, `SELLAUTH_SHOP_ID`). Open `https://<your-worker>.workers.dev/` :
-it lists any missing names.
+2. В форме заполни значения секретов (таблица «Где взять ключи» — шаг 2 ниже).
+   Если форма **не** спросила ключи: Worker → Settings → Variables and Secrets →
+   Add → тип **Secret** → добавь пять ключей из таблицы (после добавления redeploy не нужен).
+3. Дождись сборки (Deployments). При успехе открой `https://<worker>.workers.dev/` —
+   должна появиться строка `Lava x SellAuth bridge is running. build 2026-11-21.2`,
+   либо список недостающих секретов со статусом 503.
 
-## 1. Deploy manually (alternative)
+Возможные ошибки сборки и что делать:
+
+| Ошибка в билде | Причина / решение |
+|---|---|
+| `The entry-point file at "src/index.js" was not found` | в репозитории нет папки `src` — залей `src/index.js` через Add file → Upload files (имя файла указывай как `src/index.js`) |
+| `Cannot retry a build that was created with a seed_repo override` | кнопка Retry для первого билда не работает — просто запушь коммит в репо, сборка запустится сама |
+| `a namespace with this account ID and title already exists [code: 10014]` | KV-неймспейс уже создан предыдущей попыткой — открой Storage & Databases → KV, скопируй Namespace ID и впиши его в `wrangler.toml` в блок `[[kv_namespaces]]` строкой `id = "<ID>"`, закоммить |
+
+### Вариант Б — вручную через терминал
+
 ```bash
 npm install
-npx wrangler deploy --dry-run >/dev/null        # KV namespace STATE is auto-created on first deploy
-# edit SELLAUTH_SHOP_URL in wrangler.toml
-npx wrangler secret put LAVA_API_KEY          # lava.top > Settings > API
-npx wrangler secret put LAVA_WEBHOOK_KEY      # any random string (max 80 chars) you invent; same value goes into Lava (step 2)
-npx wrangler secret put LAVA_OFFER_ID         # UUID of the dynamic-price offer (step 2)
-npx wrangler secret put SELLAUTH_API_KEY      # SellAuth > Account > Developers (scope to this shop)
+npx wrangler login                                          # логин в Cloudflare (браузер откроется)
+npx wrangler kv namespace create STATE                      # скопируй id из вывода в wrangler.toml
+# отредактируй SELLAUTH_SHOP_URL в wrangler.toml
+npx wrangler secret put LAVA_API_KEY                        # значения — см. таблицу в шаге 2
+npx wrangler secret put LAVA_WEBHOOK_KEY
+npx wrangler secret put LAVA_OFFER_ID
+npx wrangler secret put SELLAUTH_API_KEY
 npx wrangler secret put SELLAUTH_SHOP_ID
-npm test && npx wrangler deploy
+npm test                                                    # проверка кода
+npx wrangler deploy
 ```
 
-## 2. Lava side (once)
-1. Create a **product with dynamic pricing** ("Цена по запросу через API") in Lava. Copy the **offer id** (UUID
-   from the product's price settings) — that is `LAVA_OFFER_ID`. The Worker charges the converted SellAuth
-   invoice amount on this offer; without dynamic pricing Lava would ignore/replace `amount`.
-2. In the same product's settings set the **webhook URL**: `https://<your-worker>.workers.dev/lava/callback`,
-   and the **webhook API key**: paste the same value you stored as the `LAVA_WEBHOOK_KEY` secret. Lava signs
-   every webhook with this key in the `X-Api-Key` header; the Worker compares it (401 otherwise).
+---
 
-## 3. Add the payment methods in SellAuth
-Dashboard > Payment Methods > add **Redirect to URL** (needs a plan with custom payment methods). Create **separate
-methods for SBP and card** — the `pay=` parameter in the URL picks the Lava method:
+## Шаг 2. Где взять каждый ключ
 
-| Method name | Redirect URL |
-|---|---|
-| Оплата картой (RUB) | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=card` |
-| Оплата СБП | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=sbp` |
-| PayPal | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=paypal` |
-| PIX | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=pix` |
-| Apple Pay | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=applepay` |
-| iDEAL | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=ideal` |
-| SEPA transfer | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=sepa` |
-| Bancontact | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=bancontact` |
-| Карта (USD) | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=cardusd` |
-| Карта (EUR) | `https://<worker>/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=cardeur` |
+Все пять ключей добавляются как **Secret** (Worker → Settings → Variables and Secrets → Add → Secret).
+Значения нигде не публикуются и при деплоях не сбрасываются.
 
-The methods are fixed in code — no currency settings needed:
-- **`pay=card`** — invoice converted to RUB, Lava's default RUB checkout (card);
-- **`pay=sbp`** — invoice converted to RUB, PAY2ME + SBP;
-- **`pay=paypal`** — invoice converted to USD, PayPal;
-- **`pay=pix`** — invoice converted to USD, UNLIMINT + PIX;
-- **`pay=applepay`** — invoice converted to USD, UNLIMINT + APPLE_PAY;
-- **`pay=ideal`** — invoice converted to EUR, UNLIMINT + IDEAL;
-- **`pay=sepa`** — invoice converted to EUR, UNLIMINT + SEPATRANSFER;
-- **`pay=bancontact`** — invoice converted to EUR, UNLIMINT + BANCONTACT;
-- **`pay=cardusd`** — invoice converted to USD, Lava's default USD checkout (UNLIMINT + card);
-- **`pay=cardeur`** — invoice converted to EUR, Lava's default EUR checkout (UNLIMINT + card);
-- no `pay` parameter — USD invoice goes to PayPal, everything else to the default RUB checkout;
-- an unknown `pay` value falls back to the default RUB checkout;
-- BIZUM/MBWAY are not offered: Lava requires the buyer's full name and phone number, which the
-  SellAuth redirect URL does not carry.
+| Секрет | Где взять | Пример вида |
+|---|---|---|
+| `LAVA_API_KEY` | app.lava.top → **Интеграции** → вкладка **API** → «+ Создать API key». Ключ для запросов к Lava из воркера | длинная строка |
+| `LAVA_WEBHOOK_KEY` | **Придумываешь сам**: любая случайная строка до 80 символов. Вставь её (а) в настройки вебхука в Lava (шаг 3.3) и (б) в этот секрет | `openssl rand -hex 32` в Git Bash |
+| `LAVA_OFFER_ID` | UUID оффера с динамической ценой — см. шаг 3.2 | `73c38598-28d4-...` |
+| `SELLAUTH_API_KEY` | dash.sellauth.com → **Account → Developers** → Create API Key, привязать к конкретному магазину. Достаточно прав: чтение инвойсов + процессинг | — |
+| `SELLAUTH_SHOP_ID` | Числовой ID магазина из адреса API (`/v1/shops/`**`42`**`/...`) | `42` |
 
-## 4. Currency and conversion
-The charge currency is chosen by the payment method (RUB for card/SBP, USD for PayPal), and the
-SellAuth invoice is converted when needed:
-- RUB target: rate source is `cbr-xml-daily.ru` (Central Bank of Russia); USD target: `open.er-api.com`;
-- rates are cached 1 h in KV; if the source is down, a cached rate up to 24 h old is used, otherwise the payment
-  is **refused** (never charged at face value);
-- converted amounts are rounded **up** to the next cent/kopeck; `LAVA_MARKUP_PCT` (wrangler.toml) adds an
-  optional safety margin, e.g. `2` = +2%;
-- delivery requires Lava to report **at least** the expected amount in the expected currency (underpayment is
-  refused, overpayment never blocks delivery).
+В `wrangler.toml` (не секрет, обычная переменная) — `SELLAUTH_SHOP_URL`: адрес твоего
+магазина, например `https://cheatandmate.com` — туда воркер возвращает покупателя после оплаты.
 
-## 5. Check the invoice shape (once)
-The Worker reads the price, currency and email from the SellAuth API, NOT from the URL (buyers can edit the URL).
-Field names in `INVOICE` (top of `src/index.js`):
-```bash
-curl -s -H "Authorization: Bearer $SELLAUTH_API_KEY" \
-  https://api.sellauth.com/v1/shops/$SHOP_ID/invoices/$INVOICE_ID | jq
+---
+
+## Шаг 3. Настройка Lava (один раз)
+
+### 3.1. Продукт с динамической ценой
+
+1. app.lava.top → **Продукты** → **Создать** → тип «Цифровой продукт».
+2. В настройках цены выбери **«Цена по запросу через API»** (динамическая цена) —
+   без этого Lava проигнорирует сумму, которую передаёт воркер, и возьмёт цену оффера.
+3. Название продукта видит покупатель на платёжной странице — сделай нейтральное
+   («Оплата заказа»), а не конкретный товар. Один продукт обслуживает ВСЕ товары магазина.
+4. Опубликуй продукт.
+
+### 3.2. Получить offerId
+
+```powershell
+$h = @{ "X-Api-Key" = "ВАШ_LAVA_API_KEY" }
+$r = Invoke-RestMethod -Uri "https://gate.lava.top/api/v2/products?feedVisibility=ALL" -Headers $h
+$r.items | ForEach-Object {
+  $p = $_.data; if (-not $p.id) { $p = $_ }    # API возвращает продукт и в .data, и напрямую
+  if ($p.offers) {
+    "product: " + $p.title + "  (id " + $p.id + ")"
+    $p.offers | ForEach-Object { "  offerId: " + $_.id + "  (" + $_.name + ")" }
+  }
+}
 ```
-If something can't be read the Worker refuses to start a payment and `npx wrangler tail` prints the keys it saw.
 
-## Base URLs (settings in `wrangler.toml`)
-| Var | Default |
+`feedVisibility=ALL` нужен, чтобы увидеть ещё не опубликованные продукты.
+Нужен `offers[].id` (НЕ id продукта) → это значение секрета `LAVA_OFFER_ID`.
+
+### 3.3. Вебхук
+
+Интеграции → API → **«Добавить Webhook»**:
+
+- **URL**: `https://<worker>.workers.dev/lava/callback` (обязательно с `https://`);
+- **Тип события**: «Успешная оплата» (обязательно), «Неуспешная оплата» (полезно), чарджбек — по желанию;
+- **Вид аутентификации**: **«API key вашего сервиса»** — НЕ Basic;
+- **API key**: та же строка, что лежит в секрете `LAVA_WEBHOOK_KEY`;
+- Комментарий — любой.
+
+Lava будет передавать этот ключ в заголовке `X-Api-Key`; воркер сверяет его и
+отвечает 401 на всё чужое. Если ключи не совпадут — в логе будет
+`callback REJECTED (401): X-Api-Key present = true`.
+
+### 3.4. Методы продаж
+
+«Методы продаж» / «Интеграции → API»: включи те способы, которые будешь раздавать
+(PAY2ME: СБП/карта, PayPal, UNLIMINT: PIX/Apple Pay/iDEAL/SEPA/Bancontact).
+
+⚠️ Лимиты сумм у Lava на валюту (например, для USD — **от 5 до 10 000**).
+Если покупатель выбрал метод, а сконвертированная сумма вне лимитов, он увидит
+сообщение с точным диапазоном. Для дешёвых PayPal/PIX-товаров ставь цену от $5.
+
+---
+
+## Шаг 4. Кнопки в SellAuth
+
+Dashboard → **Payment Methods** → **Add → Redirect to URL**. Одна кнопка = один способ.
+Включай только те, что включены в Lava (шаг 3.4). Подставь свой домен воркера:
+
+| Название кнопки | URL | Ограничить валютой (если SellAuth позволяет) |
+|---|---|---|
+| Оплата картой (RUB) | `https://<worker>.workers.dev/start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=card` | RUB |
+| Оплата СБП | `...start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=sbp` | RUB |
+| PayPal | `...start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=paypal` | USD |
+| PIX | `...start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=pix` | — |
+| Apple Pay | `...start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=applepay` | — |
+| iDEAL | `...start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=ideal` | — |
+| SEPA transfer | `...start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=sepa` | — |
+| Bancontact | `...start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=bancontact` | — |
+| Карта (USD) | `...start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=cardusd` | — |
+| Карта (EUR) | `...start?invoice={id}&ref={unique_id}&amount={price}&currency={currency}&email={email}&pay=cardeur` | — |
+
+Важно: `{id}`, `{unique_id}`, `{price}`, `{currency}`, `{email}` — плейсхолдеры SellAuth,
+не заменяй их. Ссылку вставляй одной строкой без переносов. Выбор метода происходит
+в чекауте SellAuth; на платёжной странице Lava метод уже зафиксирован.
+
+---
+
+## Шаг 5. Валюты и конвертация
+
+- Инвойс SellAuth конвертируется в валюту выбранного метода: RUB — курс ЦБ РФ
+  (`cbr-xml-daily.ru`), USD/EUR — `open.er-api.com`. Кэш курса 1 час; если источник
+  недоступен — берётся курс не старше 24 часов; если и его нет — оплата **отклоняется**
+  (никогда не бьём по цене «на глаз»).
+- Суммы после конвертации округляются **вверх** до копейки/цента.
+  `LAVA_MARKUP_PCT` в wrangler.toml добавляет запас: `2` = +2%.
+- Доставка требует, чтобы Lava подтвердила **не меньше** ожидаемой суммы в ожидаемой
+  валюте: недоплата — отказ, переплата — доставляем.
+
+---
+
+## Шаг 6. Проверка
+
+1. Дешёвый заказ → кнопка метода → должен открыться виджет Lava на правильную сумму/валюту.
+2. `curl.exe -i -X POST https://<worker>.workers.dev/lava/callback` → должен вернуть **401**
+   (проверка подписи; Lava сама тестирует это при добавлении вебхука).
+3. Оплати → инвойс в SellAuth становится completed, товары выданы **один раз**
+   (повторные вебхуки и крон не задваивают).
+4. Во время теста держи `npx wrangler tail --format pretty` — там видны:
+   `convert ... -> RUB`, `settle ... COMPLETED`, `SellAuth invoice processed <id>`.
+
+---
+
+## Диагностика проблем
+
+| Симптом | Что смотреть / делать |
 |---|---|
-| `LAVA_BASE_URL` | `https://gate.lava.top` |
-| `SELLAUTH_BASE_URL` | `https://api.sellauth.com/v1` |
-| `LAVA_PAYMENT_PROVIDER` | unset (Lava default: SMART_GLOCAL for RUB, UNLIMINT for EUR/USD) |
-| `LAVA_PAYMENT_METHOD` | unset (Lava default: CARD; e.g. `SBP` for PAY2ME) |
+| Страница `/` говорит `Missing: ...` | добавь перечисленные секреты |
+| Покупателю «Could not start payment.» | ищи в логе строку `lava error POST /api/v3/invoice 400 {...}` — там точная причина от Lava |
+| `Amount=... not in allowed limits=(5, 10000) for USD` | сумма вне лимитов Lava для этой валюты — покупатель видит это сообщение сам |
+| `callback REJECTED (401)` | ключ вебхука в Lava ≠ секрет `LAVA_WEBHOOK_KEY` — сверь значения |
+| PIX даёт 403 от `api.billygate.com` | PIX не активирован на стороне Lava/PSP — тикет в поддержку Lava, воркер не при чём (проверено: и USD+PIX, и EUR+PIX дают 403) |
+| Вебхук не приходит | «История Webhooks» в Lava; крон доставит пропущенное в течение 6 часов |
+| В PowerShell `curl -s` ругается | это alias Invoke-WebRequest — используй `curl.exe -s` |
 
-Your own Worker address is `https://<worker-name>.<your-subdomain>.workers.dev` (enable **workers.dev** under the Worker's
-Settings > Domains & Routes).
-
-## Routes
-| Route | Purpose |
-|---|---|
-| `GET /` | Status page: lists missing secrets, shows the deployed build |
-| `GET /start?invoice=&ref=&...` | From SellAuth. Opens a Lava contract, redirects the buyer |
-| `POST /lava/callback` | Lava webhook. X-Api-Key-verified, 401 if invalid |
-
-## Test checklist
-1. Place a cheap order, choose the Lava method, confirm you land on Lava's payment widget with the right amount.
-2. `curl -i -X POST https://<worker>/lava/callback` must return **401**.
-3. After paying, the invoice is delivered once; a webhook retry doesn't re-deliver.
-4. `npx wrangler tail` while testing: conversion, settle and mismatch decisions are all logged.
-Note: a refund/chargeback webhook is only logged; it cannot undo a delivery.
+Роуты воркера: `GET /` (статус), `GET /start` (от SellAuth), `POST /lava/callback` (вебхук Lava).
+Базовые URL: `https://gate.lava.top`, `https://api.sellauth.com/v1` (менять не нужно).
